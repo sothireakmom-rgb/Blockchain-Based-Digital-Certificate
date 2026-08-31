@@ -1,0 +1,48 @@
+// Prisma schema for the Blockchain-Based Digital Certificate backend.
+// Docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// An issuing organization. Owns the certificates it issues and is the
+/// account that authenticates against the API.
+model Organization {
+  id           String   @id @default(uuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+
+  certificates Certificate[]
+}
+
+/// Off-chain record mirroring a certificate anchored on-chain.
+/// `certificateId` and `dataHash` are the link to the smart contract.
+model Certificate {
+  id             String    @id @default(uuid())
+  /// Public id shared with the contract (hashed to bytes32 on-chain).
+  certificateId  String    @unique
+  recipientName  String
+  recipientEmail String
+  courseName     String
+  issueDate      DateTime
+  /// Null means the certificate never expires (contract expiry of 0).
+  expiryDate     DateTime?
+  /// "Valid" | "Expired" | "Revoked" - mirrors the contract's status string.
+  status         String    @default("Valid")
+  /// keccak256 of the certificate document, as stored on-chain.
+  dataHash       String
+  /// Hash of the Sepolia transaction that anchored this certificate on-chain.
+  txHash         String
+  createdAt      DateTime  @default(now())
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId])
+}

@@ -1,0 +1,15 @@
+# Secrets
+.env
+.env.local
+
+# Dependencies
+node_modules
+
+# Build / runtime output
+dist
+coverage
+*.log
+
+# Generated certificate PDFs (regenerable)
+storage
+sample-certificate.pdf
