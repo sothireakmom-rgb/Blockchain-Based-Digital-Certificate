@@ -13,3 +13,5 @@ coverage
 # Generated certificate PDFs (regenerable)
 storage
 sample-certificate.pdf
+portal-certificate.pdf
+email-preview.html

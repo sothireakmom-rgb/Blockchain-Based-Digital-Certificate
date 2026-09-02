@@ -7,6 +7,7 @@ const fs = require("node:fs");
 const { prisma } = require("../lib/prisma");
 const { getContract, toBytes32Id, computeDataHash } = require("../lib/contract");
 const { generateCertificatePdf, pdfPathFor, verificationUrl } = require("../lib/pdf");
+const { sendCertificateIssuedEmail } = require("../lib/email");
 const { authenticateToken } = require("../middleware/authenticateToken");
 const { asyncHandler } = require("../middleware/errorHandler");
 
@@ -74,6 +75,76 @@ function publicCertificate(c) {
     createdAt: c.createdAt,
   };
 }
+
+const SEPOLIA_EXPLORER = "https://sepolia.etherscan.io";
+
+/**
+ * GET /api/certificates/verify/:certificateId   (PUBLIC - no auth)
+ *
+ * The endpoint the QR code leads to. Reads the off-chain record for the human
+ * details, then asks the contract directly for the authoritative status, so a
+ * tampered or stale database row cannot make a revoked certificate look valid.
+ *
+ * Deliberately omits recipientEmail: this response is world-readable.
+ */
+router.get(
+  "/verify/:certificateId",
+  asyncHandler(async (req, res) => {
+    const { certificateId } = req.params;
+
+    const certificate = await prisma.certificate.findUnique({
+      where: { certificateId },
+      include: { organization: { select: { name: true } } },
+    });
+
+    if (!certificate) {
+      return res.status(404).json({
+        found: false,
+        error: "No certificate exists with that ID",
+        certificateId,
+      });
+    }
+
+    // Authoritative status comes from the chain, not the database.
+    let onChain = { found: false };
+    try {
+      const { contract } = getContract();
+      const result = await contract.verifyCertificate(toBytes32Id(certificateId));
+      onChain = {
+        found: true,
+        status: result.status,
+        revoked: result.revoked,
+        dataHash: result.dataHash,
+        issueDate: new Date(Number(result.issueDate) * 1000).toISOString(),
+        expiryTimestamp: Number(result.expiryTimestamp),
+        // If these disagree the off-chain record was altered after issuing.
+        dataHashMatches: result.dataHash === certificate.dataHash,
+      };
+    } catch (err) {
+      onChain = {
+        found: false,
+        error: err.shortMessage || err.reason || "Certificate not found on-chain",
+      };
+    }
+
+    return res.json({
+      found: true,
+      certificateId: certificate.certificateId,
+      recipientName: certificate.recipientName,
+      courseName: certificate.courseName,
+      issueDate: certificate.issueDate,
+      expiryDate: certificate.expiryDate,
+      organizationName: certificate.organization.name,
+      dataHash: certificate.dataHash,
+      txHash: certificate.txHash,
+      // On-chain wins; fall back to the stored value only if the chain is unreachable.
+      status: onChain.found ? onChain.status : certificate.status,
+      statusSource: onChain.found ? "blockchain" : "database",
+      onChain,
+      explorerUrl: `${SEPOLIA_EXPLORER}/tx/${certificate.txHash}`,
+    });
+  })
+);
 
 /**
  * POST /api/certificates  (protected)
@@ -162,10 +233,33 @@ router.post(
         console.error(`PDF generation failed for ${certificateId}:`, err);
       }
 
+      // Email is best-effort for the same reason. sendCertificateIssuedEmail
+      // never throws, but guard anyway so nothing here can break issuing.
+      let email = { sent: false };
+      try {
+        email = await sendCertificateIssuedEmail(
+          certificate,
+          certificate.organization.name
+        );
+        if (email.sent) {
+          // Log the Resend message id so a delivery can be traced later.
+          console.log(`Email accepted for ${certificateId}: resend id ${email.id}`);
+        } else if (!email.skipped) {
+          console.error(`Email failed for ${certificateId}: ${email.error}`);
+        }
+      } catch (err) {
+        email = { sent: false, error: err.message };
+        console.error(`Email threw for ${certificateId}:`, err);
+      }
+
       return res.status(201).json({
         certificate: publicCertificate(certificate),
         blockNumber: receipt.blockNumber,
         pdfGenerated,
+        emailSent: email.sent,
+        emailSkipped: Boolean(email.skipped),
+        emailId: email.id,
+        emailError: email.sent ? undefined : email.error,
         pdfUrl: `/api/certificates/${certificateId}/pdf`,
         verificationUrl: verificationUrl(certificateId),
       });
@@ -199,6 +293,83 @@ router.get(
     return res.json({
       count: certificates.length,
       certificates: certificates.map(publicCertificate),
+    });
+  })
+);
+
+/**
+ * POST /api/certificates/:certificateId/revoke  (protected)
+ *
+ * Revokes on-chain first, then marks the database row. Same ordering as
+ * issuing: the chain is the source of truth, so the row is only updated once
+ * the revocation is actually confirmed.
+ */
+router.post(
+  "/:certificateId/revoke",
+  authenticateToken,
+  asyncHandler(async (req, res) => {
+    const { certificateId } = req.params;
+
+    // Scoped to the caller's org, so one org cannot revoke another's.
+    const certificate = await prisma.certificate.findFirst({
+      where: { certificateId, organizationId: req.organizationId },
+    });
+
+    if (!certificate) {
+      return res.status(404).json({ error: "Certificate not found" });
+    }
+
+    if (certificate.status === "Revoked") {
+      return res.status(409).json({
+        error: "This certificate has already been revoked",
+        certificateId,
+        status: "Revoked",
+      });
+    }
+
+    let receipt;
+    try {
+      const { contract } = getContract();
+      const tx = await contract.revokeCertificate(toBytes32Id(certificateId));
+      receipt = await tx.wait(CONFIRMATIONS);
+      if (!receipt || receipt.status !== 1) {
+        return res.status(502).json({
+          error: "Revocation transaction failed",
+          txHash: tx.hash,
+        });
+      }
+    } catch (err) {
+      const reason = err.shortMessage || err.reason || err.message || "";
+
+      // The contract already considers it revoked while our row says otherwise:
+      // reconcile the row rather than leaving the two permanently disagreeing.
+      if (/CertificateAlreadyRevoked/i.test(reason)) {
+        await prisma.certificate.update({
+          where: { id: certificate.id },
+          data: { status: "Revoked" },
+        });
+        return res.status(409).json({
+          error: "This certificate has already been revoked",
+          certificateId,
+          status: "Revoked",
+        });
+      }
+
+      return res.status(502).json({
+        error: "Failed to revoke on-chain - nothing was changed",
+        detail: reason,
+      });
+    }
+
+    const updated = await prisma.certificate.update({
+      where: { id: certificate.id },
+      data: { status: "Revoked" },
+    });
+
+    return res.json({
+      certificate: publicCertificate(updated),
+      revokeTxHash: receipt.hash,
+      blockNumber: receipt.blockNumber,
     });
   })
 );
